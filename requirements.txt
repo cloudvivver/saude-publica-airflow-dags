@@ -1,0 +1,9 @@
+# Dependências Python para as DAGs
+# Adicione aqui os pacotes necessários para suas DAGs
+
+pandas==2.1.4
+requests==2.31.0
+boto3==1.34.17
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+python-dateutil==2.8.2
