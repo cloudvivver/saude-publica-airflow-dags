@@ -5,17 +5,14 @@ Data: 2026-01-05
 """
 from datetime import datetime, timedelta
 from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
-from airflow.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.providers.standard.operators.empty import EmptyOperator
 
 # Configurações padrão
 default_args = {
     'owner': 'saude-pi',
     'depends_on_past': False,
-    'email': ['admin@saude.pi.gov.br'],
-    'email_on_failure': True,
-    'email_on_retry': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
 }
@@ -83,7 +80,6 @@ with DAG(
     processar = PythonOperator(
         task_id='processar_dados',
         python_callable=processar_dados,
-        provide_context=True,
     )
 
     # Task 4: Finalização
