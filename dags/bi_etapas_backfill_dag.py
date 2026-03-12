@@ -39,7 +39,7 @@ DEFAULT_ARGS = {
     "email_on_failure": False,
 }
 
-POD_RESOURCES = k8s.V1ResourceRequirements(
+POD_CONTAINER_RESOURCES = k8s.V1ResourceRequirements(
     requests={"cpu": "200m", "memory": "512Mi"},
     limits={"cpu": "500m", "memory": "1Gi"},
 )
@@ -106,7 +106,7 @@ def make_backfill_dag(
             get_logs=True,
             is_delete_operator_pod=True,
             startup_timeout_seconds=300,
-            resources=POD_RESOURCES,
+            container_resources=POD_CONTAINER_RESOURCES,
             on_finish_action="delete_pod",
         )
 
