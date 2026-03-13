@@ -39,11 +39,6 @@ DEFAULT_ARGS = {
     "email_on_failure": False,
 }
 
-POD_CONTAINER_RESOURCES = k8s.V1ResourceRequirements(
-    requests={"cpu": "200m", "memory": "512Mi"},
-    limits={"cpu": "500m", "memory": "1Gi"},
-)
-
 GATEWAY_URL = "http://saude-bi-gateway.saude-bi.svc.cluster.local:8080"
 RAILS_IMAGE = "961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-83"
 
@@ -106,7 +101,6 @@ def make_backfill_dag(
             get_logs=True,
             is_delete_operator_pod=True,
             startup_timeout_seconds=300,
-            container_resources=POD_CONTAINER_RESOURCES,
             on_finish_action="delete_pod",
         )
 
