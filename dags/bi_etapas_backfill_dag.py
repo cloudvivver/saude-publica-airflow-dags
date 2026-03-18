@@ -189,5 +189,13 @@ dag_saoraimundononato = make_backfill_dag(
     app_host="cuidarpi.saoraimundononato.saude.pi.gov.br",
 )
 
+dag_homolog = make_backfill_dag(
+    dag_id="bi_etapas_backfill_homolog",
+    municipio="homolog",
+    namespace="saude-homolog",
+    app_host="homolog.saude.pi.gov.br",
+    rails_image="961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-90",
+)
+
 # apresentacao e treinamento: sem DATABASE_NAME configurado → skip backfill
 # cetea: verificar se tem dados históricos relevantes antes de rodar
