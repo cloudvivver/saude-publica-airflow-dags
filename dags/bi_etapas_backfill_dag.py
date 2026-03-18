@@ -2,33 +2,37 @@
 DAG de backfill histórico de etapas de atendimento para o ClickHouse.
 
 Estratégia:
-  - Uma task por (município × dia) via KubernetesPodOperator
-  - O Pod Rails roda `rake bi_etapas:backfill_dia DATA={{ ds }}`
-  - APP_HOST injetado explicitamente (cada município tem o seu)
-  - DATABASE_USERNAME/PASSWORD sobrescritos com usuário read-only (airflow_bi)
+  - PythonOperator puro: lê direto do RDS via psycopg2 (usuário airflow_bi read-only)
+    e publica no gateway BI — sem dependência de imagem Rails.
+  - Credenciais do banco: variáveis Airflow por município (bi_db_<municipio>_*)
+    ou Secret k8s airflow-bi-db lido via env vars no scheduler.
   - max_active_runs=1 → um dia por vez por município, sem pressão no RDS
   - schedule=None → trigger via CLI ou UI
 
-Execução via CLI (recomendado para backfill inicial):
+Execução via CLI:
   kubectl exec -it deployment/airflow-scheduler -n saude-airflow -- \\
-    airflow dags backfill \\
-      --start-date 2024-01-01 \\
-      --end-date   2025-12-31 \\
-      --max-jobs   2 \\
-      bi_etapas_backfill_piripiri
+    airflow dags trigger bi_etapas_backfill_piripiri --logical-date 2024-01-01
 
 Para adicionar novo município: copiar o bloco make_backfill_dag() no final.
-O Secret airflow-bi-db deve existir no namespace do município (criado via kubectl create secret).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import hashlib
+import hmac
+import json
+import logging
+import os
+import time
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
 
+import psycopg2
+import psycopg2.extras
 from airflow import DAG
-from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from kubernetes.client import models as k8s
+from airflow.operators.python import PythonOperator
 
+log = logging.getLogger(__name__)
 
 DEFAULT_ARGS = {
     "owner": "saude-bi",
@@ -40,42 +44,302 @@ DEFAULT_ARGS = {
 }
 
 GATEWAY_URL = "http://saude-bi-gateway.saude-bi.svc.cluster.local:8080"
-RAILS_IMAGE = "961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-83"
+BATCH_SIZE  = 500
+SLEEP_MS    = 150
 
+EVENTS_ORDER = [
+    "RecepcaoIniciada",
+    "RecepcaoFinalizada",
+    "SenhaTotemEmitida",
+    "ClassificacaoRiscoRegistrada",
+    "AtendimentoIniciado",
+    "AtendimentoFinalizado",
+    "ObservacaoRegistrada",
+    "AltaAmbulatorialRegistrada",
+    "EvolucaoRegistrada",
+    "RecepcaoInternacaoRegistrada",
+    "AltaInternacaoRegistrada",
+]
+
+
+# ---------------------------------------------------------------------------
+# Queries — SQL puro, espelho exato do BackfillDiaService Ruby
+# ---------------------------------------------------------------------------
+
+def _q_recepcao_iniciada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT id, id AS id_recepcao, numprontuario, codmunicipio,
+               codunidade, codsetor, dathorainicio
+        FROM public.tb_recepcao
+        WHERE created_at BETWEEN %s AND %s AND id > %s
+        ORDER BY id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_recepcao_finalizada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT id, id AS id_recepcao, dathorafim
+        FROM public.tb_recepcao
+        WHERE dathorafim IS NOT NULL AND dathorafim BETWEEN %s AND %s AND id > %s
+        ORDER BY id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_senha_totem_emitida(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT svc.id AS id, rec.id AS id_recepcao,
+               rec.numprontuario, rec.codmunicipio, rec.codunidade, rec.codsetor,
+               rec.dathorainicio, svc.dathora_senha, svc.numseq
+        FROM public.tb_recepcao rec
+        INNER JOIN sc_controladorfila.tb_servico_seq svc
+               ON svc.amb_recepcao_id = rec.id AND svc.dathora_senha IS NOT NULL
+        WHERE svc.created_at BETWEEN %s AND %s AND svc.id > %s
+        ORDER BY svc.id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_classificacao_risco_registrada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT t.id, t.amb_recepcao_id AS id_recepcao,
+               a.codmunicipio, a.codunidade, a.codsetor, t.dathora AS dathorainicio
+        FROM public.amb_pat_triagem t
+        INNER JOIN public.tb_atendimento a ON a.id = t.amb_atendimento_id
+        WHERE t.created_at BETWEEN %s AND %s AND t.id > %s
+        ORDER BY t.id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_atendimento_iniciado(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT id, id_recepcao, dathorainicio, codmunicipio, codunidade, codsetor,
+               codprofissional, codespecialidade
+        FROM public.tb_atendimento
+        WHERE dathorainicio BETWEEN %s AND %s AND id > %s
+        ORDER BY id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_atendimento_finalizado(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT id, id_recepcao, dathorafim, codprofissional, codespecialidade
+        FROM public.tb_atendimento
+        WHERE dathorafim IS NOT NULL AND dathorafim BETWEEN %s AND %s AND id > %s
+        ORDER BY id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_observacao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT a.id, a.id_recepcao, a.dathorafim AS data_observacao, a.id_motivofinalizacao
+        FROM public.tb_atendimento a
+        INNER JOIN public.tb_motivofinalizacaoatendimento m
+               ON m.id = a.id_motivofinalizacao AND m.indmotivoobservacao = 'S'
+        WHERE a.dathorafim IS NOT NULL AND a.dathorafim BETWEEN %s AND %s AND a.id > %s
+        ORDER BY a.id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_alta_ambulatorial_registrada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT a.id, a.id_recepcao, a.dathorafim AS data_alta_ambulatorial, a.id_motivofinalizacao
+        FROM public.tb_atendimento a
+        INNER JOIN public.tb_motivofinalizacaoatendimento m
+               ON m.id = a.id_motivofinalizacao AND m.indmotivoobservacao = 'N'
+        WHERE a.dathorafim IS NOT NULL AND a.dathorafim BETWEEN %s AND %s AND a.id > %s
+        ORDER BY a.id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_evolucao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT e.id, a.id_recepcao, e.data_evolucao,
+               a.codmunicipio, a.codunidade, a.codsetor
+        FROM public.upa_evolucao_atendimento e
+        INNER JOIN public.tb_atendimento a ON a.id = e.amb_atendimento_id
+        WHERE e.created_at BETWEEN %s AND %s AND e.id > %s
+        ORDER BY e.id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_recepcao_internacao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
+    cur.execute("""
+        SELECT id, id_recepcao, data_internacao
+        FROM sc_hospital.hos_inh_recepcao_internacao
+        WHERE data_internacao BETWEEN %s AND %s AND id > %s
+        ORDER BY id LIMIT %s
+    """, (dia_inicio, dia_fim, after_id, limit))
+    return cur.fetchall()
+
+
+def _q_alta_internacao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
+    return []
+
+
+QUERY_FN = {
+    "RecepcaoIniciada":             _q_recepcao_iniciada,
+    "RecepcaoFinalizada":           _q_recepcao_finalizada,
+    "SenhaTotemEmitida":            _q_senha_totem_emitida,
+    "ClassificacaoRiscoRegistrada": _q_classificacao_risco_registrada,
+    "AtendimentoIniciado":          _q_atendimento_iniciado,
+    "AtendimentoFinalizado":        _q_atendimento_finalizado,
+    "ObservacaoRegistrada":         _q_observacao_registrada,
+    "AltaAmbulatorialRegistrada":   _q_alta_ambulatorial_registrada,
+    "EvolucaoRegistrada":           _q_evolucao_registrada,
+    "RecepcaoInternacaoRegistrada": _q_recepcao_internacao_registrada,
+    "AltaInternacaoRegistrada":     _q_alta_internacao_registrada,
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _iso(val):
+    """Converte datetime/date para ISO8601 com timezone UTC, ou None."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=timezone.utc)
+        return val.isoformat(timespec="milliseconds")
+    if isinstance(val, date):
+        return val.isoformat()
+    return str(val)
+
+
+def _row_to_dict(cursor_desc, row):
+    return {cursor_desc[i].name: _iso(v) if hasattr(v, 'isoformat') else v
+            for i, v in enumerate(row)}
+
+
+def _post_batch(gateway_url, secret, events):
+    body = json.dumps(events).encode()
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        headers["X-Audit-Signature"] = sig
+    req = urllib.request.Request(f"{gateway_url}/events/batch",
+                                 data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status not in (200, 201, 202):
+                log.warning("Gateway batch %s: %s", resp.status, resp.read()[:200])
+    except Exception as e:
+        log.error("post_batch falhou: %s", e)
+        raise
+
+
+def _backfill_dia(ds: str, municipio: str, cluster: str,
+                  db_host: str, db_port: int, db_name: str,
+                  db_user: str, db_password: str,
+                  gateway_url: str, secret: str,
+                  batch_size: int = BATCH_SIZE, sleep_ms: int = SLEEP_MS):
+    """Lê um dia de eventos do RDS e publica no gateway BI."""
+    dia = date.fromisoformat(ds)
+    dia_inicio = datetime(dia.year, dia.month, dia.day, 0, 0, 0, tzinfo=timezone.utc)
+    dia_fim    = datetime(dia.year, dia.month, dia.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    conn = psycopg2.connect(
+        host=db_host, port=db_port, dbname=db_name,
+        user=db_user, password=db_password,
+        sslmode="require", connect_timeout=10,
+        options="-c statement_timeout=60000",
+    )
+    conn.set_session(readonly=True, autocommit=True)
+
+    stats = {}
+    try:
+        for event_type in EVENTS_ORDER:
+            query_fn = QUERY_FN[event_type]
+            after_id = 0
+            count = 0
+            t0 = time.monotonic()
+
+            with conn.cursor() as cur:
+                while True:
+                    rows = query_fn(cur, dia_inicio, dia_fim, after_id, batch_size)
+                    if not rows:
+                        break
+
+                    events = []
+                    for row in rows:
+                        d = _row_to_dict(cur.description, row)
+                        events.append({
+                            "event_id":     f"backfill:{event_type}:{d['id']}",
+                            "event_type":   event_type,
+                            "timestamp":    datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                            "aggregate_id": d.get("id_recepcao"),
+                            "payload":      {k: v for k, v in d.items() if k != "id"}
+                                            | {"cluster": cluster},
+                        })
+
+                    _post_batch(gateway_url, secret, events)
+                    count += len(rows)
+                    after_id = rows[-1][0]  # primeira coluna é sempre id (cursor)
+
+                    if len(rows) < batch_size:
+                        break
+                    if sleep_ms > 0:
+                        time.sleep(sleep_ms / 1000.0)
+
+            elapsed = time.monotonic() - t0
+            stats[event_type] = count
+            log.info("[BackfillDia] %s %s: %d eventos em %.1fs", ds, event_type, count, elapsed)
+    finally:
+        conn.close()
+
+    log.info("[BackfillDia] %s %s TOTAL: %s", ds, municipio, stats)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Fábrica de DAGs
+# ---------------------------------------------------------------------------
 
 def make_backfill_dag(
     dag_id: str,
     municipio: str,
-    namespace: str,
+    db_host: str,
+    db_name: str,
     app_host: str,
-    rails_image: str = RAILS_IMAGE,
+    db_port: int = 5432,
     start_date: datetime = datetime(2024, 1, 1),
 ) -> DAG:
     """
-    Fábrica de DAG de backfill.
+    Cria um DAG de backfill para um município.
 
-    O Pod herda DATABASE_HOST, DATABASE_NAME do ConfigMap `env` do namespace,
-    mas substitui DATABASE_USERNAME/PASSWORD pelo usuário read-only `airflow_bi`
-    (Secret `airflow-bi-db`). APP_HOST é injetado explicitamente.
+    Credenciais do banco lidas de Airflow Variables:
+      bi_db_<municipio>_user     (default: airflow_bi)
+      bi_db_<municipio>_password
+
+    Ou das env vars do scheduler:
+      BI_DB_PASSWORD  (fallback genérico)
     """
+    from airflow.models import Variable
 
-    # Fontes de variáveis de ambiente (ConfigMap do município + Secret read-only)
-    env_from = [
-        k8s.V1EnvFromSource(config_map_ref=k8s.V1ConfigMapEnvSource(name="env")),
-        # Sobrescreve DATABASE_USERNAME e DATABASE_PASSWORD com usuário read-only
-        k8s.V1EnvFromSource(secret_ref=k8s.V1SecretEnvSource(name="airflow-bi-db")),
-    ]
-
-    # Variáveis explícitas (sobrescrevem o ConfigMap quando há conflito)
-    env_vars = [
-        k8s.V1EnvVar(name="APP_HOST", value=app_host),
-        k8s.V1EnvVar(name="ATENDIMENTO_EVENTS_GATEWAY_URL", value=f"{GATEWAY_URL}/events"),
-        k8s.V1EnvVar(name="PUBLISH_ATENDIMENTO_EVENTS", value="true"),
-        k8s.V1EnvVar(name="BACKFILL_SLEEP_MS", value="150"),
-        k8s.V1EnvVar(name="BACKFILL_BATCH_SIZE", value="500"),
-        # Rails precisa de RAILS_ENV
-        k8s.V1EnvVar(name="RAILS_ENV", value="production"),
-    ]
+    def _task(**context):
+        ds = context["ds"]
+        secret = os.environ.get("AUDITORIA_GATEWAY_SECRET") or \
+                 os.environ.get("ATENDIMENTO_EVENTS_GATEWAY_SECRET", "")
+        db_user = Variable.get(f"bi_db_{municipio}_user", default_var="airflow_bi")
+        db_pass = Variable.get(f"bi_db_{municipio}_password",
+                               default_var=os.environ.get("BI_DB_PASSWORD", "airflow_bi_2024!"))
+        _backfill_dia(
+            ds=ds, municipio=municipio, cluster=municipio,
+            db_host=db_host, db_port=db_port, db_name=db_name,
+            db_user=db_user, db_password=db_pass,
+            gateway_url=GATEWAY_URL,
+            secret=secret,
+        )
 
     with DAG(
         dag_id=dag_id,
@@ -87,115 +351,112 @@ def make_backfill_dag(
         max_active_runs=1,
         tags=["bi-etapas", "backfill", municipio],
     ) as dag:
-
-        KubernetesPodOperator(
+        PythonOperator(
             task_id="backfill_dia",
-            name=f"bi-etapas-backfill-{municipio}",
-            namespace=namespace,
-            image=rails_image,
-            image_pull_policy="IfNotPresent",
-            cmds=["bundle", "exec", "rake"],
-            arguments=["bi_etapas:backfill_dia", "DATA={{ ds }}"],
-            env_from=env_from,
-            env_vars=env_vars,
-            get_logs=True,
-            is_delete_operator_pod=True,
-            startup_timeout_seconds=300,
-            on_finish_action="delete_pod",
+            python_callable=_task,
         )
 
     return dag
 
 
 # ---------------------------------------------------------------------------
-# Municípios — APP_HOST extraído do ConfigMap env de cada namespace
+# Municípios
 # ---------------------------------------------------------------------------
+
+_RDS_HOST = "proxy-db-viverdb.proxy-cb8m6qcy2cyh.sa-east-1.rds.amazonaws.com"
+
+dag_homolog = make_backfill_dag(
+    dag_id="bi_etapas_backfill_homolog",
+    municipio="homolog",
+    db_host=_RDS_HOST,
+    db_name="saude_devel_pi",
+    app_host="homolog.saude.pi.gov.br",
+)
 
 dag_piripiri = make_backfill_dag(
     dag_id="bi_etapas_backfill_piripiri",
     municipio="piripiri",
-    namespace="piripiri",
+    db_host=_RDS_HOST,
+    db_name="cuidar_piripiri_pi",
     app_host="cuidarpi.piripiri.saude.pi.gov.br",
-    rails_image="961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-90",
 )
 
 dag_bomjesus = make_backfill_dag(
     dag_id="bi_etapas_backfill_bomjesus",
     municipio="bomjesus",
-    namespace="bomjesus",
+    db_host=_RDS_HOST,
+    db_name="cuidar_bomjesus_pi",
     app_host="cuidarpi.bomjesus.saude.pi.gov.br",
 )
 
 dag_campomaior = make_backfill_dag(
     dag_id="bi_etapas_backfill_campomaior",
     municipio="campomaior",
-    namespace="campomaior",
+    db_host=_RDS_HOST,
+    db_name="cuidar_campomaior_pi",
     app_host="cuidarpi.campomaior.saude.pi.gov.br",
 )
 
 dag_caps = make_backfill_dag(
     dag_id="bi_etapas_backfill_caps",
     municipio="caps",
-    namespace="caps",
+    db_host=_RDS_HOST,
+    db_name="cuidar_caps_pi",
     app_host="cuidarpi.caps.saude.pi.gov.br",
 )
 
 dag_cetea = make_backfill_dag(
     dag_id="bi_etapas_backfill_cetea",
     municipio="cetea",
-    namespace="cetea",
+    db_host=_RDS_HOST,
+    db_name="cetea_pi",
     app_host="cetea.saude.pi.gov.br",
 )
 
 dag_corrente = make_backfill_dag(
     dag_id="bi_etapas_backfill_corrente",
     municipio="corrente",
-    namespace="corrente",
+    db_host=_RDS_HOST,
+    db_name="cuidar_corrente_pi",
     app_host="cuidarpi.corrente.saude.pi.gov.br",
 )
 
 dag_floriano = make_backfill_dag(
     dag_id="bi_etapas_backfill_floriano",
     municipio="floriano",
-    namespace="floriano",
+    db_host=_RDS_HOST,
+    db_name="cuidar_floriano_pi",
     app_host="cuidarpi.floriano.saude.pi.gov.br",
 )
 
 dag_parnaiba = make_backfill_dag(
     dag_id="bi_etapas_backfill_parnaiba",
     municipio="parnaiba",
-    namespace="parnaiba",
+    db_host=_RDS_HOST,
+    db_name="cuidar_parnaiba_pi",
     app_host="cuidarpi.parnaiba.saude.pi.gov.br",
 )
 
 dag_picos = make_backfill_dag(
     dag_id="bi_etapas_backfill_picos",
     municipio="picos",
-    namespace="picos",
+    db_host=_RDS_HOST,
+    db_name="cuidar_picos_pi",
     app_host="cuidarpi.picos.saude.pi.gov.br",
 )
 
 dag_saojoao = make_backfill_dag(
     dag_id="bi_etapas_backfill_saojoao",
     municipio="saojoao",
-    namespace="saojoao",
+    db_host=_RDS_HOST,
+    db_name="cuidar_saojoao_pi",
     app_host="cuidarpi.saojoao.saude.pi.gov.br",
 )
 
 dag_saoraimundononato = make_backfill_dag(
     dag_id="bi_etapas_backfill_saoraimundononato",
     municipio="saoraimundononato",
-    namespace="saoraimundononato",
+    db_host=_RDS_HOST,
+    db_name="cuidar_saoraimundononato_pi",
     app_host="cuidarpi.saoraimundononato.saude.pi.gov.br",
 )
-
-dag_homolog = make_backfill_dag(
-    dag_id="bi_etapas_backfill_homolog",
-    municipio="homolog",
-    namespace="saude-homolog",
-    app_host="homolog.saude.pi.gov.br",
-    rails_image="961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-90",
-)
-
-# apresentacao e treinamento: sem DATABASE_NAME configurado → skip backfill
-# cetea: verificar se tem dados históricos relevantes antes de rodar
