@@ -252,7 +252,6 @@ def _backfill_dia(ds: str, municipio: str, cluster: str,
         host=db_host, port=db_port, dbname=db_name,
         user=db_user, password=db_password,
         sslmode="require", connect_timeout=10,
-        options="-c statement_timeout=60000",
     )
     conn.set_session(readonly=True, autocommit=True)
 
