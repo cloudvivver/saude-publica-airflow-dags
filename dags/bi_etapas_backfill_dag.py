@@ -173,13 +173,18 @@ def _q_evolucao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
 
 
 def _q_recepcao_internacao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
-    cur.execute("""
-        SELECT id, id_recepcao, data_internacao
-        FROM sc_hospital.hos_inh_recepcao_internacao
-        WHERE data_internacao BETWEEN %s AND %s AND id > %s
-        ORDER BY id LIMIT %s
-    """, (dia_inicio, dia_fim, after_id, limit))
-    return cur.fetchall()
+    try:
+        cur.execute("""
+            SELECT id, id_recepcao, data_internacao
+            FROM sc_hospital.hos_inh_recepcao_internacao
+            WHERE data_internacao BETWEEN %s AND %s AND id > %s
+            ORDER BY id LIMIT %s
+        """, (dia_inicio, dia_fim, after_id, limit))
+        return cur.fetchall()
+    except Exception as e:
+        cur.connection.rollback()
+        log.warning("RecepcaoInternacaoRegistrada: tabela indisponível neste banco — %s", e)
+        return []
 
 
 def _q_alta_internacao_registrada(cur, dia_inicio, dia_fim, after_id, limit):
