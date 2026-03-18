@@ -223,9 +223,20 @@ def _iso(val):
     return str(val)
 
 
+def _coerce(v):
+    """Converte tipos Python não-JSON-serializáveis para tipos básicos."""
+    if v is None:
+        return None
+    if hasattr(v, 'isoformat'):
+        return _iso(v)
+    # psycopg2 retorna Decimal para NUMERIC — converte para int ou float
+    if hasattr(v, 'is_integer'):  # Decimal
+        return int(v) if v == int(v) else float(v)
+    return v
+
+
 def _row_to_dict(cursor_desc, row):
-    return {cursor_desc[i].name: _iso(v) if hasattr(v, 'isoformat') else v
-            for i, v in enumerate(row)}
+    return {cursor_desc[i].name: _coerce(v) for i, v in enumerate(row)}
 
 
 def _post_batch(gateway_url, secret, events):
