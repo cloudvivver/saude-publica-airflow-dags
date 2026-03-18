@@ -116,7 +116,7 @@ dag_piripiri = make_backfill_dag(
     municipio="piripiri",
     namespace="piripiri",
     app_host="cuidarpi.piripiri.saude.pi.gov.br",
-    rails_image="961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-82",
+    rails_image="961341521437.dkr.ecr.sa-east-1.amazonaws.com/saude-publica-web:master-90",
 )
 
 dag_bomjesus = make_backfill_dag(
