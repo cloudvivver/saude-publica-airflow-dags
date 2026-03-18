@@ -106,7 +106,7 @@ def _q_senha_totem_emitida(cur, dia_inicio, dia_fim, after_id, limit):
 def _q_classificacao_risco_registrada(cur, dia_inicio, dia_fim, after_id, limit):
     cur.execute("""
         SELECT t.id, t.amb_recepcao_id AS id_recepcao,
-               a.codmunicipio, a.codunidade, a.codsetor, t.dathora AS dathorainicio
+               a.codmunicipio, a.codunidade, a.codsetor, t.created_at AS dathorainicio
         FROM public.amb_pat_triagem t
         INNER JOIN public.tb_atendimento a ON a.id = t.amb_atendimento_id
         WHERE t.created_at BETWEEN %s AND %s AND t.id > %s
