@@ -67,11 +67,12 @@ EVENTS_ORDER = [
 # ---------------------------------------------------------------------------
 
 def _q_recepcao_iniciada(cur, dia_inicio, dia_fim, after_id, limit):
+    # tb_recepcao não tem created_at — usa dathorainicio como data do evento
     cur.execute("""
         SELECT id, id AS id_recepcao, numprontuario, codmunicipio,
                codunidade, codsetor, dathorainicio
         FROM public.tb_recepcao
-        WHERE created_at BETWEEN %s AND %s AND id > %s
+        WHERE dathorainicio BETWEEN %s AND %s AND id > %s
         ORDER BY id LIMIT %s
     """, (dia_inicio, dia_fim, after_id, limit))
     return cur.fetchall()
@@ -88,14 +89,15 @@ def _q_recepcao_finalizada(cur, dia_inicio, dia_fim, after_id, limit):
 
 
 def _q_senha_totem_emitida(cur, dia_inicio, dia_fim, after_id, limit):
+    # tb_recepcao.id_totem → sc_controladorfila.tb_servico_seq.id
+    # data: svc.dathoragravacao (quando a senha foi gravada)
     cur.execute("""
         SELECT svc.id AS id, rec.id AS id_recepcao,
                rec.numprontuario, rec.codmunicipio, rec.codunidade, rec.codsetor,
-               rec.dathorainicio, svc.dathora_senha, svc.numseq
+               rec.dathorainicio, svc.dathoragravacao AS dathoragravacao_senha, svc.numseq
         FROM public.tb_recepcao rec
-        INNER JOIN sc_controladorfila.tb_servico_seq svc
-               ON svc.amb_recepcao_id = rec.id AND svc.dathora_senha IS NOT NULL
-        WHERE svc.created_at BETWEEN %s AND %s AND svc.id > %s
+        INNER JOIN sc_controladorfila.tb_servico_seq svc ON svc.id = rec.id_totem
+        WHERE svc.dathoragravacao BETWEEN %s AND %s AND svc.id > %s
         ORDER BY svc.id LIMIT %s
     """, (dia_inicio, dia_fim, after_id, limit))
     return cur.fetchall()
