@@ -27,6 +27,8 @@ import time
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
+from decimal import Decimal
+
 import psycopg2
 import psycopg2.extras
 from airflow import DAG
@@ -229,9 +231,8 @@ def _coerce(v):
         return None
     if hasattr(v, 'isoformat'):
         return _iso(v)
-    # psycopg2 retorna Decimal para NUMERIC — converte para int ou float
-    if hasattr(v, 'is_integer'):  # Decimal
-        return int(v) if v == int(v) else float(v)
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
     return v
 
 
