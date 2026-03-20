@@ -346,9 +346,10 @@ def make_backfill_dag(
 
     def _task(**context):
         ds = context["ds"]
-        secret = os.environ.get("AUDITORIA_GATEWAY_SECRET") or \
-                 os.environ.get("ATENDIMENTO_EVENTS_GATEWAY_SECRET", "")
-        db_user = Variable.get(f"bi_db_{municipio}_user", default_var="airflow_bi")
+        secret = (os.environ.get("AUDITORIA_GATEWAY_SECRET") or
+                  os.environ.get("ATENDIMENTO_EVENTS_GATEWAY_SECRET") or
+                  Variable.get("AUDITORIA_GATEWAY_SECRET", default_var=""))
+        db_user = Variable.get(f"bi_db_{municipio}_user", default_var="postgres")
         db_pass = Variable.get(f"bi_db_{municipio}_password",
                                default_var=os.environ.get("BI_DB_PASSWORD", "airflow_bi_2024!"))
         _backfill_dia(
