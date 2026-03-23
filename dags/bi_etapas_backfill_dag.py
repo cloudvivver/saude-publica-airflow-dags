@@ -353,7 +353,7 @@ def make_backfill_dag(
         db_pass = Variable.get(f"bi_db_{municipio}_password",
                                default_var=os.environ.get("BI_DB_PASSWORD", "airflow_bi_2024!"))
         _backfill_dia(
-            ds=ds, municipio=municipio, cluster=municipio,
+            ds=ds, municipio=municipio, cluster=app_host,
             db_host=db_host, db_port=db_port, db_name=db_name,
             db_user=db_user, db_password=db_pass,
             gateway_url=GATEWAY_URL,
