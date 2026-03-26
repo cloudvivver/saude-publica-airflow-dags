@@ -6,7 +6,7 @@ Estratégia:
     e publica no gateway BI — sem dependência de imagem Rails.
   - Credenciais do banco: variáveis Airflow por município (bi_db_<municipio>_*)
     ou Secret k8s airflow-bi-db lido via env vars no scheduler.
-  - max_active_runs=1 → um dia por vez por município, sem pressão no RDS
+  - max_active_runs=10 → até 10 dias em paralelo por município
   - schedule=None → trigger via CLI ou UI
 
 Execução via CLI:
@@ -367,7 +367,7 @@ def make_backfill_dag(
         schedule=None,
         start_date=start_date,
         catchup=True,
-        max_active_runs=1,
+        max_active_runs=10,
         tags=["bi-etapas", "backfill", municipio],
     ) as dag:
         PythonOperator(
